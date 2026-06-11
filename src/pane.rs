@@ -119,6 +119,25 @@ const PROCESS_ACQUISITION_FAST_RECHECK: std::time::Duration = std::time::Duratio
 const PROCESS_ACQUISITION_SLOW_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
 const PROCESS_ACQUISITION_IDLE_RESET: std::time::Duration = std::time::Duration::from_secs(2);
 const STABLE_VISIBLE_SIGNAL_REFRESH: std::time::Duration = std::time::Duration::from_millis(800);
+/// Minimum interval between output-driven detection passes. A pane flooding the
+/// PTY bumps the generation on every read batch; without a floor the detection
+/// task re-extracts the screen per batch. Wakes arriving inside the window
+/// coalesce into one pass at its end, so detection still sees every change with
+/// at most this much extra latency.
+const DETECTION_OUTPUT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Sleep out the remainder of [`DETECTION_OUTPUT_DEBOUNCE`] after an output
+/// wake. Wakes that fire during the sleep set the Notify permit and re-enter
+/// the loop immediately afterwards, where they are debounced in turn.
+async fn debounce_output_wake(last_pass_started_at: Option<std::time::Instant>) {
+    let Some(last_pass) = last_pass_started_at else {
+        return;
+    };
+    let elapsed = last_pass.elapsed();
+    if elapsed < DETECTION_OUTPUT_DEBOUNCE {
+        tokio::time::sleep(DETECTION_OUTPUT_DEBOUNCE - elapsed).await;
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct AgentDetectionPresence {
@@ -451,6 +470,7 @@ fn spawn_basic_detection_task(
         let mut release_was_active = false;
         let mut last_detection_text = String::new();
         let mut last_output_generation: u64 = 0;
+        let mut last_pass_started_at: Option<std::time::Instant> = None;
         let detect_wake = terminal.detection_wake();
 
         loop {
@@ -476,7 +496,13 @@ fn spawn_basic_detection_task(
             };
             tokio::select! {
                 _ = tokio::time::sleep(fallback) => {}
-                _ = detect_wake.notified() => {}
+                _ = detect_wake.notified() => {
+                    // Skip the debounce while the loop is in a fast-tick mode
+                    // (pending agent release) — it must keep its 50ms cadence.
+                    if fallback >= DETECTION_OUTPUT_DEBOUNCE {
+                        debounce_output_wake(last_pass_started_at).await;
+                    }
+                }
                 _ = detect_reset.notified() => {
                     agent_presence = AgentDetectionPresence::from_agent(None);
                     state = AgentState::Unknown;
@@ -497,6 +523,7 @@ fn spawn_basic_detection_task(
             }
 
             let now = std::time::Instant::now();
+            last_pass_started_at = Some(now);
             let suppressed_agent = active_pending_release(&pending_release_for_task, now);
             if suppressed_agent.is_none() && release_was_active {
                 has_process_probe = false;
@@ -1740,6 +1767,7 @@ impl PaneRuntime {
                 let mut last_visible_signal_refresh = None;
                 let mut last_detection_text = String::new();
                 let mut last_output_generation: u64 = 0;
+                let mut last_pass_started_at: Option<Instant> = None;
                 let detect_wake = terminal.detection_wake();
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1764,7 +1792,13 @@ impl PaneRuntime {
                     };
                     tokio::select! {
                         _ = tokio::time::sleep(tick) => {}
-                        _ = detect_wake.notified() => {}
+                        _ = detect_wake.notified() => {
+                            // Skip the debounce while the loop is in a fast-tick
+                            // mode (pending release / color-override restore).
+                            if tick >= DETECTION_OUTPUT_DEBOUNCE {
+                                debounce_output_wake(last_pass_started_at).await;
+                            }
+                        }
                         _ = detect_reset.notified() => {
                             agent_presence = AgentDetectionPresence::from_agent(None);
                             state = AgentState::Unknown;
@@ -1787,6 +1821,7 @@ impl PaneRuntime {
                     }
 
                     let now = Instant::now();
+                    last_pass_started_at = Some(now);
                     let suppressed_agent = active_pending_release(&pending_release_for_task, now);
                     if suppressed_agent.is_none() && release_was_active {
                         has_process_probe = false;
