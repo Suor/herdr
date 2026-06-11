@@ -602,6 +602,8 @@ fn spawn_basic_detection_task(
             // The detection task is event-driven: detect_wake fires on PTY output,
             // so idle panes park on a long fallback (seconds) and burn ~0 CPU.
             // A pending release or working->idle confirmation needs a faster tick.
+            let visible_signal_held =
+                last_visible_blocker || last_visible_idle || last_visible_working;
             let sleep_duration =
                 if active_pending_release(&pending_release_for_task, std::time::Instant::now())
                     .is_some()
@@ -616,8 +618,7 @@ fn spawn_basic_detection_task(
                     detection_idle_fallback(
                         has_process_probe,
                         acquisition_started_at.is_some(),
-                        (last_visible_blocker || last_visible_idle || last_visible_working)
-                            && terminal.hook_authority_present(),
+                        visible_signal_held && terminal.hook_authority_present(),
                         agent_presence.current_agent().is_some(),
                     )
                 };
@@ -1959,6 +1960,8 @@ impl PaneRuntime {
 
                 loop {
                     let now_for_tick = Instant::now();
+                    let visible_signal_held =
+                        last_visible_blocker || last_visible_idle || last_visible_working;
                     let tick = if active_pending_release(&pending_release_for_task, now_for_tick)
                         .is_some()
                         || terminal.has_transient_default_color_override()
@@ -1972,8 +1975,7 @@ impl PaneRuntime {
                         detection_idle_fallback(
                             has_process_probe,
                             acquisition_started_at.is_some(),
-                            (last_visible_blocker || last_visible_idle || last_visible_working)
-                                && terminal.hook_authority_present(),
+                            visible_signal_held && terminal.hook_authority_present(),
                             agent_presence.current_agent().is_some(),
                         )
                     };

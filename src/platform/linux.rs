@@ -40,40 +40,30 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
 
 /// The PID itself plus all its descendants, via /proc/<pid>/task/<tid>/children.
 fn descendant_pids(root: u32) -> Vec<u32> {
-    let mut pids = vec![root];
-    let mut next = 0;
-    while next < pids.len() {
-        let pid = pids[next];
-        next += 1;
+    let mut pids = Vec::new();
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
         let tasks = std::fs::read_dir(format!("/proc/{pid}/task"));
         for task in tasks.into_iter().flatten().flatten() {
-            let children_path = task.path().join("children");
-            let Ok(children) = std::fs::read_to_string(children_path) else {
-                continue;
-            };
-            for child in children.split_ascii_whitespace() {
-                if let Ok(child) = child.parse::<u32>() {
-                    pids.push(child);
-                }
+            if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
+                queue.extend(
+                    children
+                        .split_ascii_whitespace()
+                        .filter_map(|child| child.parse::<u32>().ok()),
+                );
             }
         }
+        pids.push(pid);
     }
     pids
 }
 
 fn all_pids() -> Option<Vec<u32>> {
-    let mut pids = Vec::new();
-    for entry in std::fs::read_dir("/proc").ok()? {
-        let entry = entry.ok()?;
-        let file_name = entry.file_name();
-        let pid_str = file_name.to_str()?;
-        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        if let Ok(pid) = pid_str.parse() {
-            pids.push(pid);
-        }
-    }
+    let pids = std::fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .collect();
     Some(pids)
 }
 
