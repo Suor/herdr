@@ -1265,6 +1265,11 @@ impl HeadlessServer {
         if self.foreground_client_id == Some(client_id) {
             self.app.state.outer_terminal_focus = Some(next_focus);
         }
+        // A focus change flips what counts as displayed without touching the
+        // layout, so the current pane_infos stay valid — re-sync immediately.
+        // FocusLost alone never triggers a render, and waiting for the next
+        // one would let the first post-hide output stream a frame.
+        self.sync_pane_visibility_to_runtimes(self.any_displaying_render_client());
     }
 
     /// Accepts pending client connections from the non-blocking listener.
@@ -2864,6 +2869,21 @@ impl HeadlessServer {
         }
     }
 
+    /// Whether any frame-receiving client can actually display them: its host
+    /// terminal has not reported focus loss (a hidden Guake/terminal tab sends
+    /// FocusOut; terminals that never report focus stay `None` = displaying).
+    /// FocusGained counts as interaction and forces a render, which re-syncs
+    /// visibility; after FocusLost the next render does the same.
+    fn any_displaying_render_client(&self) -> bool {
+        render_targets(&self.clients, self.foreground_client_id)
+            .iter()
+            .any(|(client_id, ..)| {
+                self.clients
+                    .get(client_id)
+                    .is_none_or(|client| client.outer_terminal_focus != Some(false))
+            })
+    }
+
     /// Push per-pane visibility down to the pane runtimes after a full render,
     /// when `state.view.pane_infos` reflects what is actually on screen. A
     /// hidden pane's PTY output then stops waking the render loop (see
@@ -3174,7 +3194,7 @@ impl HeadlessServer {
         if !deferred_frame {
             self.app.full_redraw_pending = false;
         }
-        self.sync_pane_visibility_to_runtimes(true);
+        self.sync_pane_visibility_to_runtimes(self.any_displaying_render_client());
         crate::render_prof::duration_since("full_render.total", full_started);
         debug!(cols, rows, foreground_client_id = ?self.foreground_client_id, "rendered virtual frame(s)");
     }
@@ -6258,6 +6278,27 @@ next_tab = ""
         assert_eq!(runtime_visible(&server, &on_screen_terminal_id), true);
         assert_eq!(runtime_visible(&server, &hidden_terminal_id), false);
         assert_eq!(server.app.render_dirty.load(Ordering::Acquire), true);
+
+        // The client's host terminal reports focus loss (hidden Guake tab):
+        // nothing it receives is displayed, so every pane counts as hidden.
+        server
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .outer_terminal_focus = Some(false);
+        server.render_and_stream();
+        assert_eq!(runtime_visible(&server, &on_screen_terminal_id), false);
+        assert_eq!(runtime_visible(&server, &hidden_terminal_id), false);
+
+        // Focus returns: the rendered pane is visible again.
+        server
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .outer_terminal_focus = Some(true);
+        server.render_and_stream();
+        assert_eq!(runtime_visible(&server, &on_screen_terminal_id), true);
+        assert_eq!(runtime_visible(&server, &hidden_terminal_id), false);
     }
 
     #[tokio::test]
