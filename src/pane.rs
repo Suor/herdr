@@ -1745,15 +1745,23 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 observe_detection_content_change(bytes, &detection_content_seq);
-                if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
+                // Output of a hidden pane updates the grid but cannot change
+                // any rendered frame — don't wake the render loop for it.
+                if result.request_render
+                    && terminal.visible_to_client()
+                    && !render_dirty.swap(true, Ordering::AcqRel)
+                {
                     render_notify.notify_one();
                 }
                 if let Some(delay) = result.render_delay {
                     let render_notify = render_notify.clone();
                     let render_dirty = render_dirty.clone();
+                    let terminal = terminal.clone();
                     delay_rt.spawn(async move {
                         tokio::time::sleep(delay).await;
-                        if !render_dirty.swap(true, Ordering::AcqRel) {
+                        if terminal.visible_to_client()
+                            && !render_dirty.swap(true, Ordering::AcqRel)
+                        {
                             render_notify.notify_one();
                         }
                     });
@@ -1900,15 +1908,23 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 observe_detection_content_change(bytes, &detection_content_seq);
-                if result.request_render && !render_dirty.swap(true, Ordering::AcqRel) {
+                // Output of a hidden pane updates the grid but cannot change
+                // any rendered frame — don't wake the render loop for it.
+                if result.request_render
+                    && terminal.visible_to_client()
+                    && !render_dirty.swap(true, Ordering::AcqRel)
+                {
                     render_notify.notify_one();
                 }
                 if let Some(delay) = result.render_delay {
                     let render_notify = render_notify.clone();
                     let render_dirty = render_dirty.clone();
+                    let terminal = terminal.clone();
                     rt.spawn(async move {
                         tokio::time::sleep(delay).await;
-                        if !render_dirty.swap(true, Ordering::AcqRel) {
+                        if terminal.visible_to_client()
+                            && !render_dirty.swap(true, Ordering::AcqRel)
+                        {
                             render_notify.notify_one();
                         }
                     });
@@ -2342,9 +2358,20 @@ impl PaneRuntime {
         self.terminal.set_hook_authority_present(present);
     }
 
+    /// App-layer feedback: whether this pane is part of a rendered client view
+    /// (see `PaneTerminal::set_visible_to_client`). Returns the previous value.
+    pub fn set_visible_to_client(&self, visible: bool) -> bool {
+        self.terminal.set_visible_to_client(visible)
+    }
+
     #[cfg(test)]
     pub fn hook_authority_present(&self) -> bool {
         self.terminal.hook_authority_present()
+    }
+
+    #[cfg(test)]
+    pub fn visible_to_client(&self) -> bool {
+        self.terminal.visible_to_client()
     }
 
     pub fn begin_graceful_release(&self, agent: Agent) {

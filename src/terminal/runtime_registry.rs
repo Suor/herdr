@@ -37,6 +37,22 @@ impl TerminalRuntimeRegistry {
         self.runtimes.values()
     }
 
+    /// Push per-pane client visibility down to every pane runtime. Returns
+    /// true when any pane became visible — its output may have been skipped
+    /// while it was hidden, so the caller should schedule a follow-up render.
+    pub(crate) fn sync_visible_to_client(
+        &self,
+        mut is_visible: impl FnMut(&TerminalId) -> bool,
+    ) -> bool {
+        let mut any_became_visible = false;
+        for (terminal_id, runtime) in &self.runtimes {
+            let visible = is_visible(terminal_id);
+            let was_visible = runtime.set_visible_to_client(visible);
+            any_became_visible |= visible && !was_visible;
+        }
+        any_became_visible
+    }
+
     #[cfg(unix)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&TerminalId, &TerminalRuntime)> {
         self.runtimes.iter()
