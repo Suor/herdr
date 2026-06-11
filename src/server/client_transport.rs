@@ -400,29 +400,24 @@ fn client_writer_loop(
     wake: std::sync::Arc<ClientWriterWake>,
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
-    let mut control_closed = false;
-    let mut render_closed = false;
+    use std::sync::mpsc::TryRecvError;
     let mut seen: u64 = 0;
 
     loop {
         // Drain reliable control messages first.
-        loop {
+        let control_closed = loop {
             match control_rx.try_recv() {
                 Ok(data) => {
                     if !write_framed_bytes(&mut stream, &data) {
                         return;
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    control_closed = true;
-                    break;
-                }
+                Err(err) => break err == TryRecvError::Disconnected,
             }
-        }
+        };
 
         // Then the droppable render frame (capacity 1).
-        loop {
+        let render_closed = loop {
             match render_rx.try_recv() {
                 Ok(data) => {
                     let _ = server_event_tx
@@ -431,13 +426,9 @@ fn client_writer_loop(
                         return;
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    render_closed = true;
-                    break;
-                }
+                Err(err) => break err == TryRecvError::Disconnected,
             }
-        }
+        };
 
         if control_closed && render_closed {
             break;
@@ -446,20 +437,14 @@ fn client_writer_loop(
         // Block until a sender bumps the counter (or the safety tick elapses).
         // Re-checking against `seen` makes an enqueue between the drain above and
         // this wait impossible to miss.
-        match wake.counter.lock() {
-            Ok(counter) => {
-                let result = wake.cvar.wait_timeout_while(
-                    counter,
-                    Duration::from_secs(1),
-                    |count| *count == seen,
-                );
-                match result {
-                    Ok((counter, _)) => seen = *counter,
-                    Err(_) => break,
-                }
-            }
-            Err(_) => break,
-        }
+        let Ok(counter) = wake.counter.lock() else { break };
+        let Ok((counter, _)) =
+            wake.cvar
+                .wait_timeout_while(counter, Duration::from_secs(1), |count| *count == seen)
+        else {
+            break;
+        };
+        seen = *counter;
     }
     debug!("client writer thread exiting");
 }

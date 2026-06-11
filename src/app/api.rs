@@ -133,9 +133,10 @@ impl App {
             | AppEvent::HookAgentReleased { pane_id, .. } => Some(*pane_id),
             _ => None,
         };
-        let had_overlay_restore = overlay_state.is_some();
-        let had_released_agent = released_agent.is_some();
-        let had_update_ready = update_ready.is_some();
+        // The overlay-restore, agent-release, and update-toast paths below all
+        // change rendered output when present.
+        let forces_render =
+            overlay_state.is_some() || released_agent.is_some() || update_ready.is_some();
         let previous_toast = self.state.toast.clone();
         let pane_updates = self.state.handle_app_event(ev);
         if let Some(pane_id) = hook_authority_pane {
@@ -250,12 +251,7 @@ impl App {
         self.sync_toast_deadline(previous_toast);
         self.shutdown_detached_terminal_runtimes();
 
-        pane_dirtied
-            || toast_changed
-            || had_overlay_restore
-            || had_released_agent
-            || had_update_ready
-            || terminal_cwd_reported
+        pane_dirtied || toast_changed || forces_render || terminal_cwd_reported
     }
 
     /// Pushes "a hook authority exists for this pane's terminal" down to the

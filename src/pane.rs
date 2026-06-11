@@ -454,6 +454,8 @@ fn spawn_basic_detection_task(
         let detect_wake = terminal.detection_wake();
 
         loop {
+            let visible_signal_held =
+                last_visible_blocker || last_visible_idle || last_visible_working;
             let fallback = if active_pending_release(
                 &pending_release_for_task,
                 std::time::Instant::now(),
@@ -468,8 +470,7 @@ fn spawn_basic_detection_task(
                 detection_idle_fallback(
                     has_process_probe,
                     acquisition_started_at.is_some(),
-                    (last_visible_blocker || last_visible_idle || last_visible_working)
-                        && terminal.hook_authority_present(),
+                    visible_signal_held && terminal.hook_authority_present(),
                     agent_presence.current_agent().is_some(),
                 )
             };
@@ -507,12 +508,9 @@ fn spawn_basic_detection_task(
             let mut agent_changed = false;
             let mut agent = agent_presence.current_agent();
 
-            // Idle fast-path. On an unchanged screen, the whole tick is redundant:
-            // detection_text() returns the same text, the foreground group is
-            // (almost always) unchanged, and the published state cannot change.
-            // Skip everything unless (a) the grid changed, (b) a time-based process
-            // recheck is due, or (c) a stable visible-signal refresh is due. This
-            // turns idle panes — the common case — into a single atomic load.
+            // Idle fast-path. On an unchanged screen the whole tick is redundant,
+            // so skip it — text extraction, /proc reads, compares — unless the
+            // grid changed or a time-based recheck/refresh is due.
             let generation = terminal.output_generation();
             let generation_changed = generation != last_output_generation;
             last_output_generation = generation;
@@ -535,13 +533,12 @@ fn spawn_basic_detection_task(
                     elapsed_since_process_check: now.duration_since(last_process_check),
                 });
 
-            // A visible signal is being held; while a hook authority exists it
-            // is republished every STABLE_VISIBLE_SIGNAL_REFRESH even when the
-            // screen is static, so screen signals can veto a stale hook report.
-            // Without a hook authority the republish is a no-op app-side — skip it.
+            // A held visible signal is republished every STABLE_VISIBLE_SIGNAL_REFRESH
+            // even when the screen is static, so screen signals can veto a stale hook
+            // report. Without a hook authority the republish is a no-op — skip it.
             let hook_authority_present = terminal.hook_authority_present();
             let visible_signal_refresh_due = hook_authority_present
-                && (last_visible_blocker || last_visible_idle || last_visible_working)
+                && visible_signal_held
                 && last_visible_signal_refresh.is_none_or(|last| {
                     now.duration_since(last) >= STABLE_VISIBLE_SIGNAL_REFRESH
                 });
@@ -551,13 +548,11 @@ fn spawn_basic_detection_task(
             }
 
             // Re-extract the screen text only when the grid actually changed.
-            let content_changed;
+            let mut content_changed = false;
             if generation_changed {
                 let new_content = terminal.detection_text();
                 content_changed = new_content != last_detection_text;
                 last_detection_text = new_content;
-            } else {
-                content_changed = false;
             }
             let content = &last_detection_text;
             if crate::detect::should_skip_state_update(agent, content) {
@@ -1750,6 +1745,8 @@ impl PaneRuntime {
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
                 loop {
+                    let visible_signal_held =
+                        last_visible_blocker || last_visible_idle || last_visible_working;
                     let tick = if active_pending_release(&pending_release_for_task, Instant::now())
                         .is_some()
                         || terminal.has_transient_default_color_override()
@@ -1761,8 +1758,7 @@ impl PaneRuntime {
                         detection_idle_fallback(
                             has_process_probe,
                             acquisition_started_at.is_some(),
-                            (last_visible_blocker || last_visible_idle || last_visible_working)
-                                && terminal.hook_authority_present(),
+                            visible_signal_held && terminal.hook_authority_present(),
                             agent_presence.current_agent().is_some(),
                         )
                     };
@@ -1824,7 +1820,7 @@ impl PaneRuntime {
 
                     let hook_authority_present = terminal.hook_authority_present();
                     let visible_signal_refresh_due = hook_authority_present
-                        && (last_visible_blocker || last_visible_idle || last_visible_working)
+                        && visible_signal_held
                         && last_visible_signal_refresh.is_none_or(|last| {
                             now.duration_since(last) >= STABLE_VISIBLE_SIGNAL_REFRESH
                         });
@@ -1837,13 +1833,11 @@ impl PaneRuntime {
                         continue;
                     }
 
-                    let content_changed;
+                    let mut content_changed = false;
                     if generation_changed {
                         let new_content = terminal.detection_text();
                         content_changed = new_content != last_detection_text;
                         last_detection_text = new_content;
-                    } else {
-                        content_changed = false;
                     }
                     let content = &last_detection_text;
                     if detect::should_skip_state_update(agent_presence.current_agent(), content) {

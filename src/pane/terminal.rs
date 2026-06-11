@@ -111,11 +111,6 @@ pub(crate) struct GhosttyPaneTerminal {
     pub core: Mutex<GhosttyPaneCore>,
     key_encoder: Mutex<crate::ghostty::KeyEncoder>,
     pending_pty_responses: Arc<Mutex<Vec<Bytes>>>,
-    /// Bumped whenever the terminal grid changes (PTY output, resize). The
-    /// detection task compares it across wakeups to skip all per-tick work
-    /// (text extraction, /proc reads) on timer wakeups where the grid is
-    /// unchanged, and to coalesce bursts of wake notifications.
-    output_generation: AtomicU64,
 }
 
 pub(crate) struct GhosttyPaneCore {
@@ -137,6 +132,11 @@ pub(crate) struct GhosttyPaneCore {
 
 pub(crate) struct PaneTerminal {
     pub(crate) ghostty: GhosttyPaneTerminal,
+    /// Bumped whenever the terminal grid changes (PTY output, resize). The
+    /// detection task compares it across wakeups to skip all per-tick work
+    /// (text extraction, /proc reads) when the grid is unchanged, and to
+    /// coalesce bursts of wake notifications.
+    output_generation: AtomicU64,
     /// Woken whenever PTY output changes the grid, so the detection task can be
     /// event-driven instead of polling on a fixed timer. Idle panes never fire
     /// this, so their detection task parks on a long fallback timer (~0 CPU).
@@ -153,6 +153,7 @@ impl PaneTerminal {
     pub(crate) fn new(ghostty: GhosttyPaneTerminal) -> Self {
         Self {
             ghostty,
+            output_generation: AtomicU64::new(1),
             detection_wake: Arc::new(Notify::new()),
             hook_authority_present: AtomicBool::new(false),
         }
@@ -186,6 +187,9 @@ impl PaneTerminal {
         bytes: &[u8],
         response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
+        if !bytes.is_empty() {
+            self.output_generation.fetch_add(1, Ordering::AcqRel);
+        }
         let result = self
             .ghostty
             .process_pty_bytes(pane_id, shell_pid, bytes, response_writer);
@@ -203,7 +207,8 @@ impl PaneTerminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Vec<Bytes> {
-        // Resize reflows the grid (bumps output_generation); rerun detection.
+        // Resize reflows the grid; rerun detection.
+        self.output_generation.fetch_add(1, Ordering::AcqRel);
         self.detection_wake.notify_one();
         self.ghostty
             .resize(rows, cols, cell_width_px, cell_height_px)
@@ -256,7 +261,7 @@ impl PaneTerminal {
     /// Current grid generation. Bumped on PTY output and resize. Detection ticks
     /// compare this across ticks to skip all per-tick work on unchanged screens.
     pub fn output_generation(&self) -> u64 {
-        self.ghostty.output_generation()
+        self.output_generation.load(Ordering::Acquire)
     }
 
     pub fn recent_text(&self, lines: usize) -> String {
@@ -420,7 +425,6 @@ impl GhosttyPaneTerminal {
             }),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
-            output_generation: AtomicU64::new(1),
         })
     }
 
@@ -478,9 +482,6 @@ impl GhosttyPaneTerminal {
         _response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
         crate::render_prof::counter("pty.bytes", bytes.len() as u64);
-        if !bytes.is_empty() {
-            self.output_generation.fetch_add(1, Ordering::AcqRel);
-        }
         let Ok(mut core) = self.core.lock() else {
             error!(pane = pane_id.raw(), "ghostty core lock poisoned in reader");
             return ProcessBytesResult {
@@ -750,8 +751,6 @@ impl GhosttyPaneTerminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Vec<Bytes> {
-        // Resize reflows the grid, so detection_text output changes too.
-        self.output_generation.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut core) = self.core.lock() {
             let offset_from_bottom = core
                 .terminal
@@ -1060,10 +1059,6 @@ impl GhosttyPaneTerminal {
             .ok()
             .and_then(|core| ghostty_visible_ansi(&core).ok())
             .unwrap_or_default()
-    }
-
-    pub fn output_generation(&self) -> u64 {
-        self.output_generation.load(Ordering::Acquire)
     }
 
     pub fn detection_text(&self) -> String {
