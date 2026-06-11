@@ -15,8 +15,54 @@ pub fn raise_server_nofile_limit() {}
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     let tpgid = foreground_process_group_id(child_pid)?;
-    let mut processes = Vec::new();
 
+    // The foreground group members were spawned by the pane's shell, so walking
+    // the shell's descendant tree (a handful of /proc reads) finds them without
+    // stat'ing every process on the system. This runs on the detection probe
+    // path, which panes with periodic output (top, log tails) re-trigger
+    // indefinitely. Fall back to the full /proc scan only when the walk finds
+    // no group member (a member reparented away from the shell, or
+    // /proc/<pid>/task/<tid>/children unavailable).
+    let mut processes = collect_group_processes(descendant_pids(child_pid), tpgid);
+    if processes.is_empty() {
+        processes = collect_group_processes(all_pids()?, tpgid);
+    }
+
+    if processes.is_empty() {
+        return None;
+    }
+
+    Some(ForegroundJob {
+        process_group_id: tpgid,
+        processes,
+    })
+}
+
+/// The PID itself plus all its descendants, via /proc/<pid>/task/<tid>/children.
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let mut pids = vec![root];
+    let mut next = 0;
+    while next < pids.len() {
+        let pid = pids[next];
+        next += 1;
+        let tasks = std::fs::read_dir(format!("/proc/{pid}/task"));
+        for task in tasks.into_iter().flatten().flatten() {
+            let children_path = task.path().join("children");
+            let Ok(children) = std::fs::read_to_string(children_path) else {
+                continue;
+            };
+            for child in children.split_ascii_whitespace() {
+                if let Ok(child) = child.parse::<u32>() {
+                    pids.push(child);
+                }
+            }
+        }
+    }
+    pids
+}
+
+fn all_pids() -> Option<Vec<u32>> {
+    let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc").ok()? {
         let entry = entry.ok()?;
         let file_name = entry.file_name();
@@ -24,12 +70,16 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
         if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
+        if let Ok(pid) = pid_str.parse() {
+            pids.push(pid);
+        }
+    }
+    Some(pids)
+}
 
-        let pid: u32 = match pid_str.parse() {
-            Ok(pid) => pid,
-            Err(_) => continue,
-        };
-
+fn collect_group_processes(pids: Vec<u32>, tpgid: u32) -> Vec<ForegroundProcess> {
+    let mut processes = Vec::new();
+    for pid in pids {
         let Some((pgrp, name)) = process_pgrp_and_comm(pid) else {
             continue;
         };
@@ -46,15 +96,7 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
             argv,
         });
     }
-
-    if processes.is_empty() {
-        return None;
-    }
-
-    Some(ForegroundJob {
-        process_group_id: tpgid,
-        processes,
-    })
+    processes
 }
 
 pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJob> {
