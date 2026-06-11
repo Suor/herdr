@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -7,6 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::{layout::Rect, Frame};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tracing::{debug, error};
 use unicode_width::UnicodeWidthStr;
 
@@ -137,11 +139,46 @@ pub(crate) struct GhosttyPaneCore {
 
 pub(crate) struct PaneTerminal {
     pub(crate) ghostty: GhosttyPaneTerminal,
+    /// Woken whenever PTY output changes the grid, so the detection task can be
+    /// event-driven instead of polling on a fixed timer. Idle panes never fire
+    /// this, so their detection task parks on a long fallback timer (~0 CPU).
+    detection_wake: Arc<Notify>,
+    /// Set by the app layer when a hook authority exists for this pane's
+    /// terminal. The stable visible-signal refresh exists only to reconcile
+    /// screen signals against a (possibly stale) hook authority, so the
+    /// detection task keeps its 800ms refresh cadence only while this is set;
+    /// panes without hook integration — the common case — skip it entirely.
+    hook_authority_present: AtomicBool,
 }
 
 impl PaneTerminal {
     pub(crate) fn new(ghostty: GhosttyPaneTerminal) -> Self {
-        Self { ghostty }
+        Self {
+            ghostty,
+            detection_wake: Arc::new(Notify::new()),
+            hook_authority_present: AtomicBool::new(false),
+        }
+    }
+
+    /// A handle the detection task waits on; fired by `process_pty_bytes` when
+    /// the grid changes.
+    pub(crate) fn detection_wake(&self) -> Arc<Notify> {
+        self.detection_wake.clone()
+    }
+
+    /// Whether the app layer currently holds a hook authority for this pane.
+    pub(crate) fn hook_authority_present(&self) -> bool {
+        self.hook_authority_present.load(Ordering::Acquire)
+    }
+
+    /// App-layer feedback for the detection task (see the field docs). On a
+    /// false→true transition the (possibly parked) detection task is woken so
+    /// the visible-signal refresh cadence resumes promptly.
+    pub(crate) fn set_hook_authority_present(&self, present: bool) {
+        let was_present = self.hook_authority_present.swap(present, Ordering::AcqRel);
+        if present && !was_present {
+            self.detection_wake.notify_one();
+        }
     }
 
     pub fn process_pty_bytes(
@@ -151,8 +188,14 @@ impl PaneTerminal {
         bytes: &[u8],
         response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
-        self.ghostty
-            .process_pty_bytes(pane_id, shell_pid, bytes, response_writer)
+        let result = self
+            .ghostty
+            .process_pty_bytes(pane_id, shell_pid, bytes, response_writer);
+        // Output that changed the grid should rerun agent detection promptly.
+        if result.request_render || result.render_delay.is_some() {
+            self.detection_wake.notify_one();
+        }
+        result
     }
 
     pub fn resize(
@@ -162,6 +205,8 @@ impl PaneTerminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Vec<Bytes> {
+        // Resize reflows the grid, so rerun agent detection promptly.
+        self.detection_wake.notify_one();
         self.ghostty
             .resize(rows, cols, cell_width_px, cell_height_px)
     }

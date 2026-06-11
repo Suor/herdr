@@ -12,9 +12,13 @@ use tracing::{debug, warn};
 
 use crate::pty::fd;
 
-// Actor handle methods must call wake_actor() after queuing work. The idle
-// timeout is only a fallback for missed wakes; PTY and wake readiness drive
-// normal responsiveness.
+// Actor handle methods must call wake_actor() after queuing work; PTY output
+// and write readiness wake poll() directly, so the actor can safely block until
+// a real event — an idle pane's actor uses zero CPU. (Tests keep a finite tick
+// so timer-driven test harnesses still progress.)
+#[cfg(not(test))]
+const ACTOR_IDLE_POLL_MS: i32 = -1;
+#[cfg(test)]
 const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_WRITE_READY_POLL_MS: i32 = 50;
 const ACTOR_COMMAND_BUFFER: usize = 1024;

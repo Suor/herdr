@@ -37,7 +37,7 @@ use self::agent_detection::{
     detection_update_for_publish_with_osc, mark_detection_content_changed,
     observe_detection_content_change, DetectionPublishDecision, DetectionScreenReadDecision,
     DetectionScreenReadInput, PendingIdleConfirmation, ScreenDetectionPublishInput,
-    AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW,
+    AGENT_PENDING_IDLE_RECHECK, AGENT_STARTUP_GRACE_WINDOW, STABLE_VISIBLE_SIGNAL_REFRESH,
 };
 use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
 pub(crate) use self::terminal::{TerminalDirtyPatch, TerminalDirtyPatchOutcome};
@@ -220,8 +220,7 @@ async fn apply_agent_detection_publish_update(
 
 const AGENT_MISS_CONFIRMATION_ATTEMPTS: u8 = 6;
 const PROCESS_RECHECK_IDENTIFIED: std::time::Duration = std::time::Duration::from_secs(5);
-const PROCESS_RECHECK_MISSING_FOREGROUND_GROUP: std::time::Duration =
-    std::time::Duration::from_secs(30);
+const PROCESS_RECHECK_UNIDENTIFIED: std::time::Duration = std::time::Duration::from_secs(30);
 const PROCESS_ACQUISITION_WINDOW: std::time::Duration = std::time::Duration::from_secs(8);
 const PROCESS_ACQUISITION_FAST_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
 const PROCESS_ACQUISITION_FAST_RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
@@ -348,10 +347,13 @@ fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
     }
 
     if input.current_agent.is_none() {
+        // The time-based recheck must fire even when a foreground group is
+        // known: a silent `exec` replaces the foreground process without
+        // changing the group or repainting the screen, so neither
+        // `foreground_group_changed` nor an output wakeup will ever observe it.
         return !input.has_process_probe
             || foreground_group_changed
-            || (input.foreground_pgid.is_none()
-                && input.elapsed_since_process_check >= PROCESS_RECHECK_MISSING_FOREGROUND_GROUP);
+            || input.elapsed_since_process_check >= PROCESS_RECHECK_UNIDENTIFIED;
     }
 
     foreground_group_changed || input.elapsed_since_process_check >= PROCESS_RECHECK_IDENTIFIED
@@ -532,6 +534,31 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
     )
 }
 
+/// Fallback sleep for a detection task between PTY-output wakeups. The task is
+/// woken immediately on output (terminal.detection_wake), so this only bounds the
+/// time-driven obligations: periodic process reprobing and stable visible-signal
+/// refresh. Idle panes with no held signal park for seconds — near-zero CPU —
+/// while an agent screen keeps the 800ms refresh cadence.
+fn detection_idle_fallback(
+    has_process_probe: bool,
+    acquisition_active: bool,
+    visible_signal_held: bool,
+    agent_identified: bool,
+) -> std::time::Duration {
+    if !has_process_probe {
+        // First probe of this pane has not happened yet; do it promptly.
+        std::time::Duration::from_millis(300)
+    } else if acquisition_active {
+        PROCESS_ACQUISITION_FAST_RECHECK
+    } else if visible_signal_held {
+        STABLE_VISIBLE_SIGNAL_REFRESH
+    } else if agent_identified {
+        PROCESS_RECHECK_IDENTIFIED
+    } else {
+        PROCESS_RECHECK_UNIDENTIFIED
+    }
+}
+
 #[cfg(unix)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
@@ -569,15 +596,34 @@ fn spawn_basic_detection_task(
         let mut last_screen_scan_detection_content_seq = None;
         let mut agent_startup_grace_until = None;
         let mut pending_idle = PendingIdleConfirmation::default();
+        let detect_wake = terminal.detection_wake();
 
         loop {
-            let sleep_duration = if pending_idle.active() {
-                AGENT_PENDING_IDLE_RECHECK
-            } else {
-                std::time::Duration::from_millis(300)
-            };
+            // The detection task is event-driven: detect_wake fires on PTY output,
+            // so idle panes park on a long fallback (seconds) and burn ~0 CPU.
+            // A pending release or working->idle confirmation needs a faster tick.
+            let sleep_duration =
+                if active_pending_release(&pending_release_for_task, std::time::Instant::now())
+                    .is_some()
+                {
+                    std::time::Duration::from_millis(50)
+                } else if pending_idle.active() {
+                    AGENT_PENDING_IDLE_RECHECK
+                } else {
+                    // A held visible signal only shortens the fallback while a hook
+                    // authority exists, since the stable-signal refresh's only job is
+                    // to reconcile screen signals against that authority.
+                    detection_idle_fallback(
+                        has_process_probe,
+                        acquisition_started_at.is_some(),
+                        (last_visible_blocker || last_visible_idle || last_visible_working)
+                            && terminal.hook_authority_present(),
+                        agent_presence.current_agent().is_some(),
+                    )
+                };
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
+                _ = detect_wake.notified() => {}
                 _ = detect_reset.notified() => {
                     agent_presence = AgentDetectionPresence::from_agent(None);
                     state = AgentState::Unknown;
@@ -1872,8 +1918,6 @@ impl PaneRuntime {
             use crate::detect;
             use std::time::{Duration, Instant};
 
-            const TICK_UNIDENTIFIED: Duration = Duration::from_millis(500);
-            const TICK_IDENTIFIED: Duration = Duration::from_millis(300);
             const TICK_PENDING_RELEASE: Duration = Duration::from_millis(50);
 
             let child_pid = child_pid.clone();
@@ -1909,6 +1953,7 @@ impl PaneRuntime {
                 let mut last_screen_scan_detection_content_seq = None;
                 let mut agent_startup_grace_until = None;
                 let mut pending_idle = PendingIdleConfirmation::default();
+                let detect_wake = terminal.detection_wake();
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1921,13 +1966,20 @@ impl PaneRuntime {
                         TICK_PENDING_RELEASE
                     } else if pending_idle.active() {
                         AGENT_PENDING_IDLE_RECHECK
-                    } else if agent_presence.current_agent().is_none() {
-                        TICK_UNIDENTIFIED
                     } else {
-                        TICK_IDENTIFIED
+                        // See spawn_basic_detection_task: a held visible signal
+                        // only shortens the fallback while a hook authority exists.
+                        detection_idle_fallback(
+                            has_process_probe,
+                            acquisition_started_at.is_some(),
+                            (last_visible_blocker || last_visible_idle || last_visible_working)
+                                && terminal.hook_authority_present(),
+                            agent_presence.current_agent().is_some(),
+                        )
                     };
                     tokio::select! {
                         _ = tokio::time::sleep(tick) => {}
+                        _ = detect_wake.notified() => {}
                         _ = detect_reset.notified() => {
                             agent_presence = AgentDetectionPresence::from_agent(None);
                             state = AgentState::Unknown;
@@ -2110,7 +2162,6 @@ impl PaneRuntime {
                     let process_exited = pending_foreground_shell_clear
                         && agent.is_some()
                         && !foreground_shell_exit_reported;
-
                     if lifecycle_authority_active && !process_exited {
                         pending_idle.clear();
                         continue;
@@ -2245,6 +2296,18 @@ impl PaneRuntime {
             preserve_processes_on_drop: false,
             detect_handle,
         })
+    }
+
+    /// App-layer feedback: whether a hook authority currently exists for this
+    /// pane's terminal. The detection task uses it to gate the stable
+    /// visible-signal refresh (see `PaneTerminal::set_hook_authority_present`).
+    pub fn set_hook_authority_present(&self, present: bool) {
+        self.terminal.set_hook_authority_present(present);
+    }
+
+    #[cfg(test)]
+    pub fn hook_authority_present(&self) -> bool {
+        self.terminal.hook_authority_present()
     }
 
     pub fn begin_graceful_release(&self, agent: Agent) {
@@ -3267,9 +3330,11 @@ mod tests {
     }
 
     #[test]
-    fn stable_unidentified_foreground_group_has_no_safety_process_probe() {
-        assert!(!should_probe_foreground_job(ProcessProbeInput {
-            elapsed_since_process_check: PROCESS_RECHECK_MISSING_FOREGROUND_GROUP,
+    fn stable_unidentified_foreground_group_reprobes_on_cadence() {
+        // A silent `exec` swaps the foreground process without changing the
+        // group, so a stable group must still get the periodic safety probe.
+        assert!(should_probe_foreground_job(ProcessProbeInput {
+            elapsed_since_process_check: PROCESS_RECHECK_UNIDENTIFIED,
             ..process_probe_input()
         }));
     }
@@ -3284,7 +3349,7 @@ mod tests {
         assert!(should_probe_foreground_job(ProcessProbeInput {
             foreground_pgid: None,
             last_foreground_pgid: None,
-            elapsed_since_process_check: PROCESS_RECHECK_MISSING_FOREGROUND_GROUP,
+            elapsed_since_process_check: PROCESS_RECHECK_UNIDENTIFIED,
             ..process_probe_input()
         }));
     }

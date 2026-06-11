@@ -829,10 +829,11 @@ impl App {
     pub(crate) fn handle_internal_event_with_prefix_sync(
         &mut self,
         event: crate::events::AppEvent,
-    ) {
+    ) -> bool {
         let previous_mode = self.state.mode;
-        self.handle_internal_event(event);
+        let dirtied = self.handle_internal_event(event);
         self.sync_prefix_input_source(previous_mode);
+        dirtied
     }
 
     #[cfg(test)]

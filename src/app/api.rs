@@ -24,14 +24,19 @@ enum RuntimeExitAction {
 }
 
 impl App {
-    pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+    /// Handles a server-internal event. Returns whether the event changed
+    /// anything that affects the rendered output, so callers can avoid a wasted
+    /// full render when an event is a no-op (e.g. a stable visible-signal refresh
+    /// republishing the same agent state). Side effects that do not change the
+    /// screen (sounds, deadlines) return `false`.
+    pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) -> bool {
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);
             #[cfg(test)]
             let _ = content;
             self.show_clipboard_feedback();
-            return;
+            return true;
         }
 
         if let AppEvent::GitStatusRefreshed {
@@ -49,14 +54,14 @@ impl App {
             } else {
                 self.last_git_remote_status_refresh = Instant::now();
             }
-            if self
+            let changed = self
                 .state
-                .apply_workspace_git_statuses(&self.terminal_runtimes, results)
-            {
+                .apply_workspace_git_statuses(&self.terminal_runtimes, results);
+            if changed {
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
             }
-            return;
+            return changed;
         }
 
         if let AppEvent::PluginCommandFinished {
@@ -87,17 +92,17 @@ impl App {
                     crate::api::schema::PluginCommandStatus::Failed
                 };
             }
-            return;
+            return true;
         }
 
         if let AppEvent::WorktreeAddFinished(result) = ev {
             self.handle_worktree_add_finished(*result);
-            return;
+            return true;
         }
 
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             self.handle_worktree_remove_finished(*result);
-            return;
+            return true;
         }
 
         if let AppEvent::PaneDied { pane_id } = &ev {
@@ -114,7 +119,7 @@ impl App {
                 self.overlay_panes.remove(pane_id);
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
-                return;
+                return true;
             }
         }
 
@@ -165,10 +170,39 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
+        // These events can set or clear `TerminalState::hook_authority`; the
+        // pane's detection task needs the updated presence flag (see
+        // sync_hook_authority_presence).
+        let hook_authority_pane = match &ev {
+            AppEvent::StateChanged { pane_id, .. }
+            | AppEvent::HookStateReported { pane_id, .. }
+            | AppEvent::HookAuthorityCleared { pane_id, .. }
+            | AppEvent::HookAgentReleased { pane_id, .. } => Some(*pane_id),
+            _ => None,
+        };
+        let had_overlay_restore = overlay_state.is_some();
+        let had_released_agent = released_agent.is_some();
+        let had_update_ready = update_ready.is_some();
         let previous_toast = self.state.toast.clone();
         let pane_updates = self.state.handle_app_event(ev);
         if let Some(agents) = manifest_update_agents {
             self.reset_agent_detection_for_agents(&agents);
+        }
+        if let Some(pane_id) = hook_authority_pane {
+            self.sync_hook_authority_presence(pane_id);
+        }
+        // A pane update is render-worthy only when it changes something the UI
+        // draws: the agent state, seen flag, agent label, or presentation
+        // (title/display-agent/custom-status). A stable visible-signal refresh
+        // republishes identical values and must NOT force a render.
+        let pane_dirtied = pane_updates.iter().any(|update| {
+            update.previous_state != update.state
+                || update.previous_seen != update.seen
+                || update.previous_agent_label != update.agent_label
+                || update.previous_presentation != update.presentation
+        });
+        if terminal_cwd_reported {
+            self.mark_git_status_refresh_due(Instant::now());
         }
         if let Some((pane_id, agent)) = released_agent {
             if pane_updates.iter().any(|update| update.pane_id == pane_id) {
@@ -216,8 +250,41 @@ impl App {
             }
         }
 
+        let toast_changed = self.state.toast != previous_toast;
         self.sync_toast_deadline(previous_toast);
         self.shutdown_detached_terminal_runtimes();
+
+        pane_dirtied
+            || toast_changed
+            || had_overlay_restore
+            || had_released_agent
+            || had_update_ready
+            || terminal_cwd_reported
+    }
+
+    /// Pushes "a hook authority exists for this pane's terminal" down to the
+    /// pane runtime, where the detection task gates the stable visible-signal
+    /// refresh on it (the refresh only reconciles screen signals against hook
+    /// authority). Hook authority is set exclusively via `HookStateReported`,
+    /// which flows through `handle_internal_event`, so the set direction is
+    /// always synced; a missed clear elsewhere only costs extra refreshes.
+    /// Fresh and restored runtimes start with the flag off, matching
+    /// `hook_authority: None` (hook authority is never persisted or handed off).
+    fn sync_hook_authority_presence(&self, pane_id: crate::layout::PaneId) {
+        let Some((ws_idx, pane_state)) = self.find_pane(pane_id) else {
+            return;
+        };
+        let present = self
+            .state
+            .terminals
+            .get(&pane_state.attached_terminal_id)
+            .is_some_and(|terminal| terminal.hook_authority.is_some());
+        if let Some(runtime) =
+            self.state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+        {
+            runtime.set_hook_authority_present(present);
+        }
     }
 
     fn reset_agent_detection_for_agents(&self, agents: &[crate::detect::Agent]) {
@@ -1348,6 +1415,72 @@ mod tests {
         let clear: serde_json::Value = serde_json::from_str(&clear).unwrap();
         assert_eq!(clear["result"]["type"], "client_window_title");
         assert_eq!(clear["result"]["reason"], "no_foreground_client");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_authority_presence_is_synced_to_the_pane_runtime() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let workspace = crate::workspace::Workspace::test_new("hooks");
+        let root = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(root).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+
+        let (events, _events_rx) = tokio::sync::mpsc::channel(4);
+        let runtime = crate::terminal::TerminalRuntime::spawn(
+            root,
+            24,
+            80,
+            std::env::temp_dir(),
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            crate::pane::PaneShellConfig::new("/bin/sh", crate::config::ShellModeConfig::NonLogin),
+            &crate::pane::PaneLaunchEnv::default(),
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        app.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        let flag = |app: &App| {
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .hook_authority_present()
+        };
+        assert_eq!(flag(&app), false);
+
+        app.handle_internal_event(AppEvent::HookStateReported {
+            pane_id: root,
+            source: "test-hook".into(),
+            agent_label: "claude".into(),
+            state: AgentState::Working,
+            message: None,
+            custom_status: None,
+            seq: Some(1),
+            session_ref: None,
+        });
+        assert_eq!(flag(&app), true);
+
+        app.handle_internal_event(AppEvent::HookAuthorityCleared {
+            pane_id: root,
+            source: Some("test-hook".into()),
+            seq: Some(2),
+        });
+        assert_eq!(flag(&app), false);
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
     }
 
     #[cfg(unix)]

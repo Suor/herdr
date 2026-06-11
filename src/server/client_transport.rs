@@ -40,6 +40,15 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 /// Maximum structured input events accepted in one client message.
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
 
+/// Wake primitive shared between the server-side senders and the writer thread.
+/// The counter increments on every enqueue; the writer blocks until it changes,
+/// which lets it wait on two channels at once with zero idle CPU.
+#[derive(Debug, Default)]
+pub(crate) struct ClientWriterWake {
+    counter: std::sync::Mutex<u64>,
+    cvar: std::sync::Condvar,
+}
+
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientWriter {
@@ -47,6 +56,37 @@ pub(crate) struct ClientWriter {
     pub(crate) control: std::sync::mpsc::Sender<Vec<u8>>,
     /// Droppable render messages. Capacity is one so slow clients cannot build lag.
     pub(crate) render: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// Bumped after every enqueue so the writer thread wakes immediately.
+    pub(crate) wake: std::sync::Arc<ClientWriterWake>,
+}
+
+impl ClientWriter {
+    fn notify_writer(&self) {
+        if let Ok(mut counter) = self.wake.counter.lock() {
+            *counter = counter.wrapping_add(1);
+            self.wake.cvar.notify_one();
+        }
+    }
+
+    /// Enqueue a reliable control message and wake the writer thread.
+    pub(crate) fn send_control(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<(), std::sync::mpsc::SendError<Vec<u8>>> {
+        let result = self.control.send(data);
+        self.notify_writer();
+        result
+    }
+
+    /// Enqueue a droppable render frame (capacity 1) and wake the writer thread.
+    pub(crate) fn try_send_render(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<(), std::sync::mpsc::TrySendError<Vec<u8>>> {
+        let result = self.render.try_send(data);
+        self.notify_writer();
+        result
+    }
 }
 
 /// Internal event sent from client transport threads to the main event loop.
@@ -308,9 +348,12 @@ pub(crate) fn handle_client_handshake(
     // Create separate channels for reliable control messages and droppable renders.
     let (control_tx, control_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let (render_tx, render_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    // Shared wake counter lets the writer thread block until a message is enqueued.
+    let wake = std::sync::Arc::new(ClientWriterWake::default());
     let writer = ClientWriter {
         control: control_tx,
         render: render_tx,
+        wake: wake.clone(),
     };
 
     // Notify the main loop about the new client.
@@ -335,6 +378,7 @@ pub(crate) fn handle_client_handshake(
             client_id,
             control_rx,
             render_rx,
+            wake,
             writer_event_tx,
         );
     });
@@ -344,68 +388,77 @@ pub(crate) fn handle_client_handshake(
 }
 
 /// The client writer loop — prioritizes control messages over render frames.
+///
+/// Drains both channels (control first), then blocks on the shared wake counter
+/// until a sender enqueues something, so an idle client costs no CPU. A 1 s
+/// safety tick bounds any missed wake, and channel disconnection ends the loop.
 fn client_writer_loop(
     mut stream: LocalStream,
     client_id: u64,
     control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    wake: std::sync::Arc<ClientWriterWake>,
     server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
     let mut control_closed = false;
     let mut render_closed = false;
+    let mut seen: u64 = 0;
 
     loop {
-        match control_rx.try_recv() {
-            Ok(data) => {
-                if !write_framed_bytes(&mut stream, &data) {
+        // Drain reliable control messages first.
+        loop {
+            match control_rx.try_recv() {
+                Ok(data) => {
+                    if !write_framed_bytes(&mut stream, &data) {
+                        return;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    control_closed = true;
                     break;
                 }
-                continue;
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => control_closed = true,
         }
 
-        match render_rx.try_recv() {
-            Ok(data) => {
-                let _ =
-                    server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
-                if !write_framed_bytes(&mut stream, &data) {
+        // Then the droppable render frame (capacity 1).
+        loop {
+            match render_rx.try_recv() {
+                Ok(data) => {
+                    let _ = server_event_tx
+                        .blocking_send(ServerEvent::ClientWriterDrained { client_id });
+                    if !write_framed_bytes(&mut stream, &data) {
+                        return;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    render_closed = true;
                     break;
                 }
-                continue;
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => render_closed = true,
         }
 
         if control_closed && render_closed {
             break;
         }
 
-        if control_closed {
-            match render_rx.recv_timeout(Duration::from_millis(5)) {
-                Ok(data) => {
-                    let _ = server_event_tx
-                        .blocking_send(ServerEvent::ClientWriterDrained { client_id });
-                    if !write_framed_bytes(&mut stream, &data) {
-                        break;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => render_closed = true,
-            }
-            continue;
-        }
-
-        match control_rx.recv_timeout(Duration::from_millis(5)) {
-            Ok(data) => {
-                if !write_framed_bytes(&mut stream, &data) {
-                    break;
+        // Block until a sender bumps the counter (or the safety tick elapses).
+        // Re-checking against `seen` makes an enqueue between the drain above and
+        // this wait impossible to miss.
+        match wake.counter.lock() {
+            Ok(counter) => {
+                let result =
+                    wake.cvar
+                        .wait_timeout_while(counter, Duration::from_secs(1), |count| {
+                            *count == seen
+                        });
+                match result {
+                    Ok((counter, _)) => seen = *counter,
+                    Err(_) => break,
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => control_closed = true,
+            Err(_) => break,
         }
     }
     debug!("client writer thread exiting");
