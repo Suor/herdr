@@ -147,6 +147,12 @@ pub(crate) struct PaneTerminal {
     /// detection task keeps its 800ms refresh cadence only while this is set;
     /// panes without hook integration — the common case — skip it entirely.
     hook_authority_present: AtomicBool,
+    /// Set by the app layer after each full render: whether this pane's
+    /// content is part of a rendered client view right now. PTY output of a
+    /// hidden pane (inactive tab/workspace, or no attached client) still
+    /// updates the grid but does not request an app render; the layout change
+    /// that reveals the pane triggers its own full render.
+    visible_to_client: AtomicBool,
 }
 
 impl PaneTerminal {
@@ -156,6 +162,9 @@ impl PaneTerminal {
             output_generation: AtomicU64::new(1),
             detection_wake: Arc::new(Notify::new()),
             hook_authority_present: AtomicBool::new(false),
+            // Renders as if visible until the app pushes real visibility after
+            // its next full render — a fresh pane must not miss its first frame.
+            visible_to_client: AtomicBool::new(true),
         }
     }
 
@@ -178,6 +187,19 @@ impl PaneTerminal {
         if present && !was_present {
             self.detection_wake.notify_one();
         }
+    }
+
+    /// Whether this pane is currently part of a rendered client view.
+    pub(crate) fn visible_to_client(&self) -> bool {
+        self.visible_to_client.load(Ordering::Acquire)
+    }
+
+    /// App-layer feedback after a full render (see the field docs). Returns
+    /// the previous value so the caller can schedule a follow-up render when a
+    /// pane becomes visible — output that arrived while it was hidden never
+    /// requested one.
+    pub(crate) fn set_visible_to_client(&self, visible: bool) -> bool {
+        self.visible_to_client.swap(visible, Ordering::AcqRel)
     }
 
     pub fn process_pty_bytes(

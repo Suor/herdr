@@ -203,6 +203,17 @@ impl TerminalRuntime {
         self.0.set_hook_authority_present(present);
     }
 
+    /// App-layer feedback: whether this pane is part of a rendered client view
+    /// (see `PaneTerminal::set_visible_to_client`). Returns the previous value.
+    pub fn set_visible_to_client(&self, visible: bool) -> bool {
+        self.0.set_visible_to_client(visible)
+    }
+
+    #[cfg(test)]
+    pub fn visible_to_client(&self) -> bool {
+        self.0.visible_to_client()
+    }
+
     #[cfg(test)]
     pub fn hook_authority_present(&self) -> bool {
         self.0.hook_authority_present()

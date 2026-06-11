@@ -2864,6 +2864,40 @@ impl HeadlessServer {
         }
     }
 
+    /// Push per-pane visibility down to the pane runtimes after a full render,
+    /// when `state.view.pane_infos` reflects what is actually on screen. A
+    /// hidden pane's PTY output then stops waking the render loop (see
+    /// `PaneTerminal::set_visible_to_client`). When a pane became visible, one
+    /// follow-up render is scheduled to catch output that raced the render.
+    fn sync_pane_visibility_to_runtimes(&self, has_render_client: bool) {
+        let visible_terminals: std::collections::HashSet<crate::terminal::TerminalId> =
+            if has_render_client {
+                self.app
+                    .state
+                    .active
+                    .and_then(|ws_idx| self.app.state.workspaces.get(ws_idx))
+                    .map(|workspace| {
+                        self.app
+                            .state
+                            .view
+                            .pane_infos
+                            .iter()
+                            .filter_map(|info| workspace.terminal_id(info.id).cloned())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Default::default()
+            };
+        let any_became_visible = self
+            .app
+            .terminal_runtimes
+            .sync_visible_to_client(|terminal_id| visible_terminals.contains(terminal_id));
+        if any_became_visible && !self.app.render_dirty.swap(true, Ordering::AcqRel) {
+            self.app.render_notify.notify_one();
+        }
+    }
+
     fn render_and_stream(&mut self) {
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
@@ -2882,6 +2916,7 @@ impl HeadlessServer {
             );
             crate::render_prof::duration_since("full_render.render_virtual", render_started);
             self.app.full_redraw_pending = false;
+            self.sync_pane_visibility_to_runtimes(false);
             crate::render_prof::duration_since("full_render.total", full_started);
             debug!(
                 cols,
@@ -3139,6 +3174,7 @@ impl HeadlessServer {
         if !deferred_frame {
             self.app.full_redraw_pending = false;
         }
+        self.sync_pane_visibility_to_runtimes(true);
         crate::render_prof::duration_since("full_render.total", full_started);
         debug!(cols, rows, foreground_client_id = ?self.foreground_client_id, "rendered virtual frame(s)");
     }
@@ -6159,6 +6195,69 @@ next_tab = ""
             client_rx.recv_timeout(Duration::from_millis(50)).is_err(),
             "identical frame should not be sent twice"
         );
+    }
+
+    #[tokio::test]
+    async fn pane_visibility_is_synced_to_runtimes_after_full_render() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("test");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        let on_screen_terminal_id = workspace
+            .terminal_id(pane_id)
+            .cloned()
+            .expect("terminal id for pane");
+        let hidden_terminal_id = crate::terminal::TerminalId::alloc();
+        server.app.terminal_runtimes.insert(
+            on_screen_terminal_id.clone(),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"shown"),
+        );
+        server.app.terminal_runtimes.insert(
+            hidden_terminal_id.clone(),
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"hidden"),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let runtime_visible = |server: &HeadlessServer, id: &crate::terminal::TerminalId| {
+            server
+                .app
+                .terminal_runtimes
+                .get(id)
+                .expect("runtime")
+                .visible_to_client()
+        };
+
+        // No clients: a virtual render marks every pane hidden.
+        server.render_and_stream();
+        assert_eq!(runtime_visible(&server, &on_screen_terminal_id), false);
+        assert_eq!(runtime_visible(&server, &hidden_terminal_id), false);
+
+        // With an attached client, the rendered pane is visible, the pane
+        // outside the view stays hidden, and the false->true transition
+        // schedules one follow-up render for output that raced the render.
+        let (client_tx, _client_control_rx, _client_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        server.app.render_dirty.store(false, Ordering::Release);
+
+        server.render_and_stream();
+        assert_eq!(runtime_visible(&server, &on_screen_terminal_id), true);
+        assert_eq!(runtime_visible(&server, &hidden_terminal_id), false);
+        assert_eq!(server.app.render_dirty.load(Ordering::Acquire), true);
     }
 
     #[tokio::test]
