@@ -121,11 +121,20 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     // /proc/<pid>/stat format: "pid (comm) state ppid pgrp session tty_nr tpgid ..."
     // The (comm) field can contain spaces and parens, so we find the last ')' first.
-    let stat = std::fs::read_to_string(format!("/proc/{child_pid}/stat")).ok()?;
+    //
+    // This runs on every detection tick of a pane with output, so avoid the
+    // allocation churn of `read_to_string` (procfs reports st_size 0, which
+    // costs it an extra probe read and reallocs) and the `Vec` collect: read
+    // once into a stack buffer and scan the fields lazily. The fields up to
+    // tpgid live in the first ~100 bytes, so a fixed buffer always captures them.
+    use std::io::Read;
+    let mut file = std::fs::File::open(format!("/proc/{child_pid}/stat")).ok()?;
+    let mut buf = [0u8; 512];
+    let n = file.read(&mut buf).ok()?;
+    let stat = std::str::from_utf8(&buf[..n]).ok()?;
     let rest = stat.get(stat.rfind(')')? + 2..)?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
     // After (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5)
-    let tpgid: i32 = fields.get(5)?.parse().ok()?;
+    let tpgid: i32 = rest.split_whitespace().nth(5)?.parse().ok()?;
     (tpgid > 0).then_some(tpgid as u32)
 }
 
