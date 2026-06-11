@@ -16,6 +16,14 @@ use crate::pty::fd;
 const ACTOR_POLL_MS: i32 = 50;
 #[cfg(test)]
 const ACTOR_POLL_MS: i32 = 1000;
+// Main idle wait. Every command send pokes the wake pipe and PTY output/write
+// readiness wake the poll directly, so the actor can safely block until a real
+// event — an idle pane's actor uses zero CPU. (Tests keep a finite tick so
+// timer-driven test harnesses still progress.)
+#[cfg(not(test))]
+const ACTOR_IDLE_POLL_MS: i32 = -1;
+#[cfg(test)]
+const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -437,7 +445,7 @@ impl PtyIoActorRunner {
                 self.wake_read_fd.as_raw_fd(),
                 self.state == ActorState::Running,
                 !self.pending_writes.is_empty(),
-                ACTOR_POLL_MS,
+                ACTOR_IDLE_POLL_MS,
             ) {
                 Ok(readiness) => {
                     if readiness.wake_ready {

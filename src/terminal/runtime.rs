@@ -197,6 +197,17 @@ impl TerminalRuntime {
         self.0.begin_graceful_release(agent);
     }
 
+    /// App-layer feedback: whether a hook authority currently exists for this
+    /// terminal. Gates the detection task's stable visible-signal refresh.
+    pub fn set_hook_authority_present(&self, present: bool) {
+        self.0.set_hook_authority_present(present);
+    }
+
+    #[cfg(test)]
+    pub fn hook_authority_present(&self) -> bool {
+        self.0.hook_authority_present()
+    }
+
     pub fn resize(&self, rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) {
         self.0.resize(rows, cols, cell_width_px, cell_height_px);
     }

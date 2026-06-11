@@ -598,7 +598,7 @@ impl HeadlessServer {
             self.drain_client_config_reload_request();
             self.stream_host_mouse_capture_mode();
 
-            self.app.sync_headless_animation_timer(now);
+            self.sync_animation_timer_headless(now);
 
             // 7. Render virtually and stream frames.
             if needs_render && self.app.can_render_now(now) {
@@ -1148,6 +1148,17 @@ impl HeadlessServer {
         self.app_client_count() > 0
     }
 
+    /// Drive the spinner animation timer only while a client is attached; with no
+    /// client there is nothing to render, so skip the per-loop working-pane scan
+    /// and ensure no stray 128 ms animation wakeups remain scheduled.
+    fn sync_animation_timer_headless(&mut self, now: Instant) {
+        if self.has_app_client() {
+            self.app.sync_headless_animation_timer(now);
+        } else {
+            self.app.clear_animation_timer();
+        }
+    }
+
     fn remove_client(&mut self, client_id: u64) -> bool {
         let was_foreground = self.foreground_client_id == Some(client_id);
         self.send_client_graphics_cleanup(client_id);
@@ -1206,7 +1217,7 @@ impl HeadlessServer {
         let Ok(serialized) = Self::frame_server_message(&ServerMessage::Graphics { bytes }) else {
             return;
         };
-        let _ = writer.control.send(serialized);
+        let _ = writer.send_control(serialized);
     }
 
     fn send_all_clients_graphics_cleanup(&mut self) {
@@ -1566,7 +1577,7 @@ impl HeadlessServer {
                 // Headless mode disables local sound playback separately from the
                 // sound policy so reloads can keep server-side notification policy live.
                 self.sync_foreground_client_state();
-                self.app.handle_internal_event(ev);
+                let dirtied = self.app.handle_internal_event(ev);
 
                 // Forward sound notification to clients when server-side sound policy allows it.
                 let is_active_tab = self
@@ -1631,7 +1642,7 @@ impl HeadlessServer {
                     );
                 }
 
-                true
+                dirtied
             }
             AppEvent::HookStateReported {
                 pane_id,
@@ -1779,10 +1790,7 @@ impl HeadlessServer {
 
                 true
             }
-            _ => {
-                self.app.handle_internal_event(ev);
-                true
-            }
+            _ => self.app.handle_internal_event(ev),
         }
     }
 
@@ -1877,7 +1885,7 @@ impl HeadlessServer {
         let mut broken_clients: Vec<u64> = Vec::new();
         for (&client_id, client) in &mut self.clients {
             if let Some(writer) = &client.writer {
-                if writer.control.send(serialized.clone()).is_err() {
+                if writer.send_control(serialized.clone()).is_err() {
                     debug!(client_id, "client writer channel closed during broadcast");
                     broken_clients.push(client_id);
                 }
@@ -1911,7 +1919,7 @@ impl HeadlessServer {
 
         if let Some(client) = self.clients.get(&client_id) {
             if let Some(writer) = &client.writer {
-                if writer.control.send(serialized).is_err() {
+                if writer.send_control(serialized).is_err() {
                     debug!(
                         client_id,
                         "client writer channel closed during targeted send"
@@ -2127,7 +2135,7 @@ impl HeadlessServer {
                             ),
                         })
                     {
-                        let _ = writer.control.send(message);
+                        let _ = writer.send_control(message);
                     }
                     return false;
                 }
@@ -2628,7 +2636,7 @@ impl HeadlessServer {
             let Some(writer) = &client.writer else {
                 continue;
             };
-            if writer.control.send(serialized.clone()).is_err() {
+            if writer.send_control(serialized.clone()).is_err() {
                 debug!(
                     client_id,
                     "client writer channel closed during mouse capture update"
@@ -2828,7 +2836,7 @@ impl HeadlessServer {
         crate::render_prof::counter("retained_send.bytes", serialized.len() as u64);
 
         let send_started = crate::render_prof::timer();
-        match writer.render.try_send(serialized) {
+        match writer.try_send_render(serialized) {
             Ok(()) => {
                 client.render_pending = false;
                 client.render_state.commit_sent_frame(frame, prepared);
@@ -3090,7 +3098,7 @@ impl HeadlessServer {
             crate::render_prof::counter("full_render.bytes", serialized.len() as u64);
 
             let send_started = crate::render_prof::timer();
-            match writer.render.try_send(serialized) {
+            match writer.try_send_render(serialized) {
                 Ok(()) => {
                     client.render_pending = false;
                     if commit_graphics_cache {
@@ -3142,7 +3150,7 @@ impl HeadlessServer {
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
 
-        self.app.sync_headless_animation_timer(now);
+        self.sync_animation_timer_headless(now);
 
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
@@ -3264,7 +3272,7 @@ impl HeadlessServer {
                 .app
                 .start_pending_agent_resumes(self.app.pending_agent_resume_due(now));
         }
-        self.app.sync_headless_animation_timer(now);
+        self.sync_animation_timer_headless(now);
         changed
     }
 
@@ -3817,6 +3825,9 @@ mod tests {
             ClientWriter {
                 control: control_tx,
                 render: render_tx,
+                wake: std::sync::Arc::new(
+                    crate::server::client_transport::ClientWriterWake::default(),
+                ),
             },
             control_rx,
             render_rx,
