@@ -24,11 +24,8 @@ enum RuntimeExitAction {
 }
 
 impl App {
-    /// Handles a server-internal event. Returns whether the event changed
-    /// anything that affects the rendered output, so callers can avoid a wasted
-    /// full render when an event is a no-op (e.g. a stable visible-signal refresh
-    /// republishing the same agent state). Side effects that do not change the
-    /// screen (sounds, deadlines) return `false`.
+    /// Handles a server-internal event. Returns whether it changed rendered
+    /// output, so callers can skip a render for no-op events.
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) -> bool {
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
@@ -170,9 +167,7 @@ impl App {
                 None
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
-        // These events can set or clear `TerminalState::hook_authority`; the
-        // pane's detection task needs the updated presence flag (see
-        // sync_hook_authority_presence).
+        // Events that can set or clear hook_authority; sync the flag below.
         let hook_authority_pane = match &ev {
             AppEvent::StateChanged { pane_id, .. }
             | AppEvent::HookStateReported { pane_id, .. }
@@ -180,8 +175,6 @@ impl App {
             | AppEvent::HookAgentReleased { pane_id, .. } => Some(*pane_id),
             _ => None,
         };
-        // The overlay-restore, agent-release, and update-toast paths below all
-        // change rendered output when present.
         let forces_render =
             overlay_state.is_some() || released_agent.is_some() || update_ready.is_some();
         let previous_toast = self.state.toast.clone();
@@ -192,10 +185,8 @@ impl App {
         if let Some(pane_id) = hook_authority_pane {
             self.sync_hook_authority_presence(pane_id);
         }
-        // A pane update is render-worthy only when it changes something the UI
-        // draws: the agent state, seen flag, agent label, or presentation
-        // (title/display-agent/custom-status). A stable visible-signal refresh
-        // republishes identical values and must NOT force a render.
+        // Render-worthy only when a drawn value actually changed; a stable
+        // visible-signal refresh republishes identical values.
         let pane_dirtied = pane_updates.iter().any(|update| {
             update.previous_state != update.state
                 || update.previous_seen != update.seen
@@ -258,14 +249,8 @@ impl App {
         pane_dirtied || toast_changed || forces_render || terminal_cwd_reported
     }
 
-    /// Pushes "a hook authority exists for this pane's terminal" down to the
-    /// pane runtime, where the detection task gates the stable visible-signal
-    /// refresh on it (the refresh only reconciles screen signals against hook
-    /// authority). Hook authority is set exclusively via `HookStateReported`,
-    /// which flows through `handle_internal_event`, so the set direction is
-    /// always synced; a missed clear elsewhere only costs extra refreshes.
-    /// Fresh and restored runtimes start with the flag off, matching
-    /// `hook_authority: None` (hook authority is never persisted or handed off).
+    /// Pushes "a hook authority exists for this pane" down to the runtime, where
+    /// the detection task gates its stable visible-signal refresh on it.
     fn sync_hook_authority_presence(&self, pane_id: crate::layout::PaneId) {
         let Some((ws_idx, pane_state)) = self.find_pane(pane_id) else {
             return;

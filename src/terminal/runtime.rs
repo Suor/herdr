@@ -222,14 +222,12 @@ impl TerminalRuntime {
         self.0.set_full_lifecycle_authority_active(active);
     }
 
-    /// App-layer feedback: whether a hook authority currently exists for this
-    /// terminal. Gates the detection task's stable visible-signal refresh.
+    /// See [`PaneTerminal::set_hook_authority_present`].
     pub fn set_hook_authority_present(&self, present: bool) {
         self.0.set_hook_authority_present(present);
     }
 
-    /// App-layer feedback: whether this pane is part of a rendered client view
-    /// (see `PaneTerminal::set_visible_to_client`). Returns the previous value.
+    /// See [`PaneTerminal::set_visible_to_client`]. Returns the previous value.
     pub fn set_visible_to_client(&self, visible: bool) -> bool {
         self.0.set_visible_to_client(visible)
     }

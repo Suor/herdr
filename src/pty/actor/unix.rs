@@ -12,10 +12,8 @@ use tracing::{debug, warn};
 
 use crate::pty::fd;
 
-// Actor handle methods must call wake_actor() after queuing work; PTY output
-// and write readiness wake poll() directly, so the actor can safely block until
-// a real event — an idle pane's actor uses zero CPU. (Tests keep a finite tick
-// so timer-driven test harnesses still progress.)
+// Command sends call wake_actor() and PTY readiness wakes poll() directly, so
+// the actor blocks until a real event. (Tests keep a finite tick to progress.)
 #[cfg(not(test))]
 const ACTOR_IDLE_POLL_MS: i32 = -1;
 #[cfg(test)]

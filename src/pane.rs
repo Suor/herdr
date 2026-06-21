@@ -226,16 +226,12 @@ const PROCESS_ACQUISITION_FAST_WINDOW: std::time::Duration = std::time::Duration
 const PROCESS_ACQUISITION_FAST_RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
 const PROCESS_ACQUISITION_SLOW_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
 const PROCESS_ACQUISITION_IDLE_RESET: std::time::Duration = std::time::Duration::from_secs(2);
-/// Minimum interval between output-driven detection passes. A pane flooding the
-/// PTY bumps the generation on every read batch; without a floor the detection
-/// task re-extracts the screen per batch. Wakes arriving inside the window
-/// coalesce into one pass at its end, so detection still sees every change with
-/// at most this much extra latency.
+/// Minimum interval between output-driven detection passes, so a flooding pane
+/// can't drive one screen re-extract per read batch. Wakes inside the window
+/// coalesce into one pass at its end.
 const DETECTION_OUTPUT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Sleep out the remainder of [`DETECTION_OUTPUT_DEBOUNCE`] after an output
-/// wake. Wakes that fire during the sleep set the Notify permit and re-enter
-/// the loop immediately afterwards, where they are debounced in turn.
+/// Sleep out the remainder of [`DETECTION_OUTPUT_DEBOUNCE`] since the last pass.
 async fn debounce_output_wake(last_pass_started_at: Option<std::time::Instant>) {
     let Some(last_pass) = last_pass_started_at else {
         return;
@@ -366,10 +362,8 @@ fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
     }
 
     if input.current_agent.is_none() {
-        // The time-based recheck must fire even when a foreground group is
-        // known: a silent `exec` replaces the foreground process without
-        // changing the group or repainting the screen, so neither
-        // `foreground_group_changed` nor an output wakeup will ever observe it.
+        // Recheck on the time cadence even with a known group: a silent `exec`
+        // swaps the foreground process with no group change and no repaint.
         return !input.has_process_probe
             || foreground_group_changed
             || input.elapsed_since_process_check >= PROCESS_RECHECK_UNIDENTIFIED;
@@ -553,11 +547,8 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
     )
 }
 
-/// Fallback sleep for a detection task between PTY-output wakeups. The task is
-/// woken immediately on output (terminal.detection_wake), so this only bounds the
-/// time-driven obligations: periodic process reprobing and stable visible-signal
-/// refresh. Idle panes with no held signal park for seconds — near-zero CPU —
-/// while an agent screen keeps the 800ms refresh cadence.
+/// Fallback sleep between PTY-output wakes: bounds only the time-driven work
+/// (process reprobing, stable-signal refresh). Idle panes park for seconds.
 fn detection_idle_fallback(
     has_process_probe: bool,
     acquisition_active: bool,
@@ -619,9 +610,8 @@ fn spawn_basic_detection_task(
         let detect_wake = terminal.detection_wake();
 
         loop {
-            // The detection task is event-driven: detect_wake fires on PTY output,
-            // so idle panes park on a long fallback (seconds) and burn ~0 CPU.
-            // A pending release or working->idle confirmation needs a faster tick.
+            // Event-driven: detect_wake fires on output; idle panes park on the
+            // long fallback. Pending release / idle confirmation tick faster.
             let visible_signal_held =
                 last_visible_blocker || last_visible_idle || last_visible_working;
             let sleep_duration =
@@ -632,9 +622,8 @@ fn spawn_basic_detection_task(
                 } else if pending_idle.active() {
                     AGENT_PENDING_IDLE_RECHECK
                 } else {
-                    // A held visible signal only shortens the fallback while a hook
-                    // authority exists, since the stable-signal refresh's only job is
-                    // to reconcile screen signals against that authority.
+                    // A held signal shortens the fallback only with a hook
+                    // authority — the refresh exists to reconcile against it.
                     detection_idle_fallback(
                         has_process_probe,
                         acquisition_started_at.is_some(),
@@ -645,8 +634,7 @@ fn spawn_basic_detection_task(
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = detect_wake.notified() => {
-                    // Skip the debounce while the loop is in a fast-tick mode
-                    // (pending agent release) — it must keep its 50ms cadence.
+                    // Skip the debounce in fast-tick modes (keep their cadence).
                     if sleep_duration >= DETECTION_OUTPUT_DEBOUNCE {
                         debounce_output_wake(last_pass_started_at).await;
                     }
@@ -1745,8 +1733,7 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 observe_detection_content_change(bytes, &detection_content_seq);
-                // Output of a hidden pane updates the grid but cannot change
-                // any rendered frame — don't wake the render loop for it.
+                // A hidden pane's output can't change any frame — don't wake render.
                 if result.request_render
                     && terminal.visible_to_client()
                     && !render_dirty.swap(true, Ordering::AcqRel)
@@ -1908,8 +1895,7 @@ impl PaneRuntime {
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 observe_detection_content_change(bytes, &detection_content_seq);
-                // Output of a hidden pane updates the grid but cannot change
-                // any rendered frame — don't wake the render loop for it.
+                // A hidden pane's output can't change any frame — don't wake render.
                 if result.request_render
                     && terminal.visible_to_client()
                     && !render_dirty.swap(true, Ordering::AcqRel)
@@ -2014,8 +2000,7 @@ impl PaneRuntime {
                     } else if pending_idle.active() {
                         AGENT_PENDING_IDLE_RECHECK
                     } else {
-                        // See spawn_basic_detection_task: a held visible signal
-                        // only shortens the fallback while a hook authority exists.
+                        // Held signal shortens the fallback only with a hook authority.
                         detection_idle_fallback(
                             has_process_probe,
                             acquisition_started_at.is_some(),
@@ -2026,8 +2011,7 @@ impl PaneRuntime {
                     tokio::select! {
                         _ = tokio::time::sleep(tick) => {}
                         _ = detect_wake.notified() => {
-                            // Skip the debounce while the loop is in a fast-tick
-                            // mode (pending release / color-override restore).
+                            // Skip the debounce in fast-tick modes (keep cadence).
                             if tick >= DETECTION_OUTPUT_DEBOUNCE {
                                 debounce_output_wake(last_pass_started_at).await;
                             }
@@ -2351,15 +2335,12 @@ impl PaneRuntime {
         })
     }
 
-    /// App-layer feedback: whether a hook authority currently exists for this
-    /// pane's terminal. The detection task uses it to gate the stable
-    /// visible-signal refresh (see `PaneTerminal::set_hook_authority_present`).
+    /// See [`PaneTerminal::set_hook_authority_present`].
     pub fn set_hook_authority_present(&self, present: bool) {
         self.terminal.set_hook_authority_present(present);
     }
 
-    /// App-layer feedback: whether this pane is part of a rendered client view
-    /// (see `PaneTerminal::set_visible_to_client`). Returns the previous value.
+    /// See [`PaneTerminal::set_visible_to_client`]. Returns the previous value.
     pub fn set_visible_to_client(&self, visible: bool) -> bool {
         self.terminal.set_visible_to_client(visible)
     }
@@ -3395,8 +3376,7 @@ mod tests {
 
     #[test]
     fn stable_unidentified_foreground_group_reprobes_on_cadence() {
-        // A silent `exec` swaps the foreground process without changing the
-        // group, so a stable group must still get the periodic safety probe.
+        // A silent `exec` keeps the group, so a stable group still needs the probe.
         assert!(should_probe_foreground_job(ProcessProbeInput {
             elapsed_since_process_check: PROCESS_RECHECK_UNIDENTIFIED,
             ..process_probe_input()

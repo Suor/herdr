@@ -353,9 +353,7 @@ impl App {
         }
     }
 
-    /// Stop the spinner animation timer. Used when no client is attached: there is
-    /// nothing to render, so neither the per-loop working-pane scan nor the 128 ms
-    /// animation wakeups are worth doing.
+    /// Stop the spinner animation timer (no client attached, nothing to render).
     pub(crate) fn clear_animation_timer(&mut self) {
         self.next_animation_tick = None;
     }

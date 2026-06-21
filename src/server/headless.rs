@@ -1151,9 +1151,8 @@ impl HeadlessServer {
         self.app_client_count() > 0
     }
 
-    /// Drive the spinner animation timer only while a client is attached; with no
-    /// client there is nothing to render, so skip the per-loop working-pane scan
-    /// and ensure no stray 128 ms animation wakeups remain scheduled.
+    /// Run the spinner animation timer only with a client attached; otherwise
+    /// there's nothing to render, so clear it.
     fn sync_animation_timer_headless(&mut self, now: Instant) {
         if self.has_app_client() {
             self.app.sync_headless_animation_timer(now);
@@ -1272,10 +1271,8 @@ impl HeadlessServer {
         if self.foreground_client_id == Some(client_id) {
             self.app.state.outer_terminal_focus = Some(next_focus);
         }
-        // A focus change flips what counts as displayed without touching the
-        // layout, so the current pane_infos stay valid — re-sync immediately.
-        // FocusLost alone never triggers a render, and waiting for the next
-        // one would let the first post-hide output stream a frame.
+        // Focus changes displayed-ness without a layout change, and FocusLost
+        // alone triggers no render, so re-sync visibility now.
         self.sync_pane_visibility_to_runtimes(self.any_displaying_render_client());
     }
 
@@ -3059,11 +3056,9 @@ impl HeadlessServer {
         }
     }
 
-    /// Whether any frame-receiving client can actually display them: its host
-    /// terminal has not reported focus loss (a hidden Guake/terminal tab sends
-    /// FocusOut; terminals that never report focus stay `None` = displaying).
-    /// FocusGained counts as interaction and forces a render, which re-syncs
-    /// visibility; after FocusLost the next render does the same.
+    /// Whether any render client can actually display frames: its host terminal
+    /// hasn't reported focus loss (a hidden tab sends FocusOut; terminals that
+    /// never report focus stay `None` = displaying).
     fn any_displaying_render_client(&self) -> bool {
         render_targets(&self.clients, self.foreground_client_id)
             .iter()
@@ -3074,11 +3069,9 @@ impl HeadlessServer {
             })
     }
 
-    /// Push per-pane visibility down to the pane runtimes after a full render,
-    /// when `state.view.pane_infos` reflects what is actually on screen. A
-    /// hidden pane's PTY output then stops waking the render loop (see
-    /// `PaneTerminal::set_visible_to_client`). When a pane became visible, one
-    /// follow-up render is scheduled to catch output that raced the render.
+    /// Push per-pane visibility down to the runtimes after a render (when
+    /// pane_infos reflect the screen), so hidden panes stop waking render. If a
+    /// pane became visible, schedule one follow-up render for output it skipped.
     fn sync_pane_visibility_to_runtimes(&self, has_render_client: bool) {
         let visible_terminals: std::collections::HashSet<crate::terminal::TerminalId> =
             if has_render_client {
@@ -6658,9 +6651,7 @@ next_tab = ""
         assert_eq!(runtime_visible(&server, &on_screen_terminal_id), false);
         assert_eq!(runtime_visible(&server, &hidden_terminal_id), false);
 
-        // With an attached client, the rendered pane is visible, the pane
-        // outside the view stays hidden, and the false->true transition
-        // schedules one follow-up render for output that raced the render.
+        // With a client: the rendered pane is visible, the off-view pane hidden.
         let (client_tx, _client_control_rx, _client_rx) = test_client_writer();
         server.clients.insert(
             1,
@@ -6684,8 +6675,7 @@ next_tab = ""
         assert_eq!(runtime_visible(&server, &hidden_terminal_id), false);
         assert_eq!(server.app.render_dirty.load(Ordering::Acquire), true);
 
-        // The client's host terminal reports focus loss (hidden Guake tab):
-        // nothing it receives is displayed, so every pane counts as hidden.
+        // Host terminal loses focus (hidden tab): every pane counts as hidden.
         server
             .clients
             .get_mut(&1)

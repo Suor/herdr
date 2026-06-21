@@ -16,13 +16,9 @@ pub fn raise_server_nofile_limit() {}
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     let tpgid = foreground_process_group_id(child_pid)?;
 
-    // The foreground group members were spawned by the pane's shell, so walking
-    // the shell's descendant tree (a handful of /proc reads) finds them without
-    // stat'ing every process on the system. This runs on the detection probe
-    // path, which panes with periodic output (top, log tails) re-trigger
-    // indefinitely. Fall back to the full /proc scan only when the walk finds
-    // no group member (a member reparented away from the shell, or
-    // /proc/<pid>/task/<tid>/children unavailable).
+    // Group members are descendants of the pane's shell, so walk that tree (a
+    // few /proc reads) instead of stat'ing every process. Fall back to a full
+    // /proc scan only if the walk finds no member (e.g. a reparented member).
     let mut processes = collect_group_processes(descendant_pids(child_pid), tpgid);
     if processes.is_empty() {
         processes = collect_group_processes(all_pids()?, tpgid);
@@ -112,11 +108,8 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     // /proc/<pid>/stat format: "pid (comm) state ppid pgrp session tty_nr tpgid ..."
     // The (comm) field can contain spaces and parens, so we find the last ')' first.
     //
-    // This runs on every detection tick of a pane with output, so avoid the
-    // allocation churn of `read_to_string` (procfs reports st_size 0, which
-    // costs it an extra probe read and reallocs) and the `Vec` collect: read
-    // once into a stack buffer and scan the fields lazily. The fields up to
-    // tpgid live in the first ~100 bytes, so a fixed buffer always captures them.
+    // Hot path (every tick of a pane with output): read once into a stack buffer
+    // instead of read_to_string + Vec. tpgid lives in the first ~100 bytes.
     use std::io::Read;
     let mut file = std::fs::File::open(format!("/proc/{child_pid}/stat")).ok()?;
     let mut buf = [0u8; 512];

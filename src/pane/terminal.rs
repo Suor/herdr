@@ -139,21 +139,15 @@ pub(crate) struct GhosttyPaneCore {
 
 pub(crate) struct PaneTerminal {
     pub(crate) ghostty: GhosttyPaneTerminal,
-    /// Woken whenever PTY output changes the grid, so the detection task can be
-    /// event-driven instead of polling on a fixed timer. Idle panes never fire
-    /// this, so their detection task parks on a long fallback timer (~0 CPU).
+    /// Fired on grid-changing PTY output so the detection task can be
+    /// event-driven; an idle pane never fires it and parks on a long fallback.
     detection_wake: Arc<Notify>,
-    /// Set by the app layer when a hook authority exists for this pane's
-    /// terminal. The stable visible-signal refresh exists only to reconcile
-    /// screen signals against a (possibly stale) hook authority, so the
-    /// detection task keeps its 800ms refresh cadence only while this is set;
-    /// panes without hook integration — the common case — skip it entirely.
+    /// Whether the app layer holds a hook authority for this pane. The stable
+    /// visible-signal refresh only reconciles against it, so the detection task
+    /// keeps that refresh cadence only while this is set.
     hook_authority_present: AtomicBool,
-    /// Set by the app layer after each full render: whether this pane's
-    /// content is part of a rendered client view right now. PTY output of a
-    /// hidden pane (inactive tab/workspace, or no attached client) still
-    /// updates the grid but does not request an app render; the layout change
-    /// that reveals the pane triggers its own full render.
+    /// Whether this pane is in a rendered client view (set after each render).
+    /// A hidden pane's output updates the grid but doesn't wake render.
     visible_to_client: AtomicBool,
 }
 
@@ -163,26 +157,22 @@ impl PaneTerminal {
             ghostty,
             detection_wake: Arc::new(Notify::new()),
             hook_authority_present: AtomicBool::new(false),
-            // Renders as if visible until the app pushes real visibility after
-            // its next full render — a fresh pane must not miss its first frame.
+            // Visible until the app pushes real visibility, so a fresh pane
+            // never misses its first frame.
             visible_to_client: AtomicBool::new(true),
         }
     }
 
-    /// A handle the detection task waits on; fired by `process_pty_bytes` when
-    /// the grid changes.
+    /// Handle the detection task waits on; fired by `process_pty_bytes`.
     pub(crate) fn detection_wake(&self) -> Arc<Notify> {
         self.detection_wake.clone()
     }
 
-    /// Whether the app layer currently holds a hook authority for this pane.
     pub(crate) fn hook_authority_present(&self) -> bool {
         self.hook_authority_present.load(Ordering::Acquire)
     }
 
-    /// App-layer feedback for the detection task (see the field docs). On a
-    /// false→true transition the (possibly parked) detection task is woken so
-    /// the visible-signal refresh cadence resumes promptly.
+    /// Wakes the parked detection task on a false→true transition.
     pub(crate) fn set_hook_authority_present(&self, present: bool) {
         let was_present = self.hook_authority_present.swap(present, Ordering::AcqRel);
         if present && !was_present {
@@ -190,15 +180,12 @@ impl PaneTerminal {
         }
     }
 
-    /// Whether this pane is currently part of a rendered client view.
     pub(crate) fn visible_to_client(&self) -> bool {
         self.visible_to_client.load(Ordering::Acquire)
     }
 
-    /// App-layer feedback after a full render (see the field docs). Returns
-    /// the previous value so the caller can schedule a follow-up render when a
-    /// pane becomes visible — output that arrived while it was hidden never
-    /// requested one.
+    /// Returns the previous value, so a hidden→visible flip can trigger a
+    /// follow-up render for output skipped while hidden.
     pub(crate) fn set_visible_to_client(&self, visible: bool) -> bool {
         self.visible_to_client.swap(visible, Ordering::AcqRel)
     }

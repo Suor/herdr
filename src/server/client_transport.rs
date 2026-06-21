@@ -40,9 +40,8 @@ const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
 /// Maximum structured input events accepted in one client message.
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
 
-/// Wake primitive shared between the server-side senders and the writer thread.
-/// The counter increments on every enqueue; the writer blocks until it changes,
-/// which lets it wait on two channels at once with zero idle CPU.
+/// Wake primitive for the writer thread: the counter bumps on every enqueue, so
+/// the writer can block on two channels at once with zero idle CPU.
 #[derive(Debug, Default)]
 pub(crate) struct ClientWriterWake {
     counter: std::sync::Mutex<u64>,
@@ -387,11 +386,9 @@ pub(crate) fn handle_client_handshake(
     client_read_loop(stream, client_id, server_event_tx, should_quit)
 }
 
-/// The client writer loop — prioritizes control messages over render frames.
-///
-/// Drains both channels (control first), then blocks on the shared wake counter
-/// until a sender enqueues something, so an idle client costs no CPU. A 1 s
-/// safety tick bounds any missed wake, and channel disconnection ends the loop.
+/// Client writer loop: drain both channels (control first), then block on the
+/// wake counter until a sender enqueues, so an idle client costs no CPU. A 1s
+/// tick bounds any missed wake; disconnection ends the loop.
 fn client_writer_loop(
     mut stream: LocalStream,
     client_id: u64,
@@ -434,9 +431,8 @@ fn client_writer_loop(
             break;
         }
 
-        // Block until a sender bumps the counter (or the safety tick elapses).
-        // Re-checking against `seen` makes an enqueue between the drain above and
-        // this wait impossible to miss.
+        // Block until the counter changes; re-checking `seen` can't miss an
+        // enqueue that raced the drain above.
         let Ok(counter) = wake.counter.lock() else {
             break;
         };
