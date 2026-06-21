@@ -210,9 +210,6 @@ impl App {
             }
         }
         self.sync_full_lifecycle_authority_detection_pauses();
-        if terminal_cwd_reported {
-            self.mark_git_status_refresh_due(Instant::now());
-        }
         for update in &pane_updates {
             self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
             self.emit_pane_state_update(update);
